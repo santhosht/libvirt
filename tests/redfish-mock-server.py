@@ -470,6 +470,8 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def dispatch(self, method):
+        if self.server.latency:
+            time.sleep(self.server.latency)
         path = self.path_only()
         st = self.state
         body = None
@@ -584,6 +586,9 @@ def main():
     ap.add_argument("--hot-plug", action="store_true",
                     help="allow changing the resource blocks of a system "
                          "that is powered on (by default it must be off)")
+    ap.add_argument("--latency", type=float, default=0.0,
+                    help="seconds to wait before answering each request, "
+                         "to exercise slow services")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
@@ -591,6 +596,7 @@ def main():
     srv.state = State(None if args.no_auth else args.user,
                       args.password, args.task_delay, args.hot_plug)
     srv.quiet = args.quiet
+    srv.latency = args.latency
     srv.daemon_threads = True
     print("listening on http://%s:%d" % srv.server_address[:2], flush=True)
     try:

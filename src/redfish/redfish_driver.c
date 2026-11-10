@@ -45,6 +45,7 @@ VIR_LOG_INIT("redfish.redfish_driver");
 #define REDFISH_DEFAULT_POLL 5 /* seconds between event polls */
 
 typedef struct _redfishPrivate redfishPrivate;
+typedef struct _redfishPollCtx redfishPollCtx;
 struct _redfishPrivate {
     redfishClient *client;
     virCaps *caps;
@@ -69,8 +70,22 @@ struct _redfishPrivate {
     virMutex startLock;     /* serializes starting and stopping polling */
     GHashTable *known;      /* uuid string -> redfishKnownSystem */
     int nCallbacks;
+    redfishPollCtx *pollCtx;
     int pollTimer;          /* -1 when not polling */
     int pollInterval;       /* milliseconds */
+};
+
+/*
+ * What the polling timer holds on to instead of the connection's data.
+ * The event loop can run a poll on another thread than the one closing
+ * the connection, so closing takes the lock (waiting for a poll in
+ * progress to end) and then cuts the link; a poll which starts after that
+ * finds nothing to work on.
+ */
+struct _redfishPollCtx {
+    GMutex lock;
+    redfishPrivate *priv;   /* NULL once the connection is closed */
+    gint refs;
 };
 
 typedef struct {
@@ -78,6 +93,18 @@ typedef struct {
     int id;
     int state;
 } redfishKnownSystem;
+
+
+static void
+redfishPollCtxUnref(void *opaque)
+{
+    redfishPollCtx *ctx = opaque;
+
+    if (g_atomic_int_dec_and_test(&ctx->refs)) {
+        g_mutex_clear(&ctx->lock);
+        g_free(ctx);
+    }
+}
 
 
 static void
@@ -98,14 +125,24 @@ redfishPrivateFree(redfishPrivate *priv)
     if (!priv)
         return;
 
+    /* First of all: stop polling and wait for a poll in progress, as it
+     * uses everything freed below */
+    if (priv->pollTimer >= 0)
+        virEventRemoveTimeout(priv->pollTimer);
+    if (priv->pollCtx) {
+        /* Waits for a poll which is running, then none can start */
+        g_mutex_lock(&priv->pollCtx->lock);
+        priv->pollCtx->priv = NULL;
+        g_mutex_unlock(&priv->pollCtx->lock);
+        redfishPollCtxUnref(priv->pollCtx);
+    }
+
     if (priv->client) {
         redfishClientLogout(priv->client);
         redfishClientFree(priv->client);
     }
     virObjectUnref(priv->caps);
     virObjectUnref(priv->xmlopt);
-    if (priv->pollTimer >= 0)
-        virEventRemoveTimeout(priv->pollTimer);
     virObjectUnref(priv->eventState);
     g_clear_pointer(&priv->known, g_hash_table_unref);
     virMutexDestroy(&priv->eventLock);
@@ -483,6 +520,10 @@ redfishConnectOpen(virConnectPtr conn,
                                         redfishKnownSystemFree);
     priv->pollTimer = -1;
     priv->pollInterval = REDFISH_DEFAULT_POLL * 1000;
+    priv->pollCtx = g_new0(redfishPollCtx, 1);
+    g_mutex_init(&priv->pollCtx->lock);
+    priv->pollCtx->priv = priv;
+    priv->pollCtx->refs = 1;
     if ((param = redfishURIParam(conn->uri, "poll"))) {
         unsigned int secs;
 
@@ -1529,7 +1570,12 @@ static void
 redfishEventsTimer(int timer G_GNUC_UNUSED,
                    void *opaque)
 {
-    redfishEventsPoll(opaque, true);
+    redfishPollCtx *ctx = opaque;
+
+    g_mutex_lock(&ctx->lock);
+    if (ctx->priv)
+        redfishEventsPoll(ctx->priv, true);
+    g_mutex_unlock(&ctx->lock);
 }
 
 
@@ -1546,9 +1592,13 @@ redfishEventsStart(redfishPrivate *priv)
             return -1;
         }
 
+        /* the timer owns a reference, dropped when it is removed */
+        g_atomic_int_inc(&priv->pollCtx->refs);
         if ((priv->pollTimer = virEventAddTimeout(priv->pollInterval,
                                                   redfishEventsTimer,
-                                                  priv, NULL)) < 0) {
+                                                  priv->pollCtx,
+                                                  redfishPollCtxUnref)) < 0) {
+            redfishPollCtxUnref(priv->pollCtx);
             virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
                            _("Could not start polling, is an event loop running?"));
             return -1;

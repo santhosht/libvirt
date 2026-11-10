@@ -386,6 +386,14 @@ Details
 - Polling runs in the caller's event loop (libvirt's default implementation
   in `virsh`), so a slow service delays other work in that loop. The caller
   must have registered an event loop, otherwise registering fails.
+- The polling timer does not point at the connection's data directly but at
+  a small object with its own lock. Closing a connection stops the timer,
+  waits for a poll which is running, and only then frees anything; a poll
+  which starts later finds the link cut and does nothing. This guards
+  against programs which run the event loop on another thread than the one
+  closing the connection. The problem was not seen without the guard, even
+  under AddressSanitizer, so it is a precaution and not a fix for an
+  observed crash.
 - Events are only seen by the process that listens. Changes are noticed
   whoever made them, but only while a listener is running.
 
@@ -415,6 +423,7 @@ python3 tests/redfish-mock-server.py --port 18001 --task-delay 2
 # --no-auth         no authentication
 # --hot-plug        allow block changes while a machine is on
 # --task-delay 0    composition answers immediately with 201
+# --latency 0.3     every request takes this many seconds
 ```
 
 It encodes this driver's reading of the specification, so it cannot show
@@ -424,6 +433,15 @@ always answers 405, so composing cannot be tested with it.
 
 Events were tested with one `virsh event` process listening while other
 `virsh` commands defined, started, stopped and removed a machine.
+
+Closing a connection while an event poll is in flight was stressed with the
+mock's `--latency 0.3` option (every request takes 0.3 s, so a poll is
+nearly always running): `virsh event --timeout` repeatedly, and a small C
+program which runs libvirt's event loop on its own thread and opens,
+registers, deregisters and closes connections at random moments. Both ended
+cleanly, with and without AddressSanitizer, but that was also the case
+before the guard was added, so these runs show that nothing broke, not that
+the guard was needed. The C program is not part of the repository.
 
 Not yet covered: automated tests, and any real service or BMC. DMTF's
 published mockup bundle could not be downloaded from here (the server
@@ -443,11 +461,6 @@ Things which work but not as well as they should.
 - **Late and lossy events.** Events are polled (decision 12), so they
   arrive up to one `poll` interval late and a change which comes and goes
   within one interval is missed. Only domain lifecycle events exist.
-- **Possible race when closing a connection.** The polling timer holds a
-  pointer to the connection's private data. Closing removes the timer, but
-  does not wait for a callback that is already running. This is unlikely
-  in `virsh`, which runs one thread, but has not been shown safe for
-  programs which close connections from another thread.
 - **Attach and detach rely on `PATCH`.** They assume a service which
   changes a system's blocks by `PATCH` on `Links.ResourceBlocks`. Services
   which do this through fabric endpoints are not supported.
@@ -480,5 +493,4 @@ want to revisit.
 3. `$expand` where the service announces it.
 4. Replace polling with the service's server-sent events where it offers
    them, for prompt events and no idle traffic.
-5. Make closing a connection wait for a running poll.
-6. Try a real service and fix what differs.
+5. Try a real service and fix what differs.
