@@ -22,9 +22,11 @@
 #include "redfish_conv.h"
 
 #include "datatypes.h"
+#include "domain_event.h"
 #include "driver.h"
 #include "virauth.h"
 #include "virerror.h"
+#include "virevent.h"
 #include "virlog.h"
 #include "virdomainobjlist.h"
 #include "virnodedeviceobj.h"
@@ -40,6 +42,7 @@ VIR_LOG_INIT("redfish.redfish_driver");
 
 #define REDFISH_ROOT "/redfish/v1"
 #define REDFISH_DEFAULT_TIMEOUT 600
+#define REDFISH_DEFAULT_POLL 5 /* seconds between event polls */
 
 typedef struct _redfishPrivate redfishPrivate;
 struct _redfishPrivate {
@@ -57,7 +60,34 @@ struct _redfishPrivate {
     virMutex pathsLock;
     GHashTable *pathByUUID;
     GHashTable *pathByName;
+
+    /* Domain events. Redfish has no way to be told about changes
+     * through this driver's connection, so while somebody listens the
+     * service is polled and the differences are turned into events. */
+    virObjectEventState *eventState;
+    virMutex eventLock;     /* protects known */
+    virMutex startLock;     /* serializes starting and stopping polling */
+    GHashTable *known;      /* uuid string -> redfishKnownSystem */
+    int nCallbacks;
+    int pollTimer;          /* -1 when not polling */
+    int pollInterval;       /* milliseconds */
 };
+
+typedef struct {
+    char *name;
+    int id;
+    int state;
+} redfishKnownSystem;
+
+
+static void
+redfishKnownSystemFree(gpointer data)
+{
+    redfishKnownSystem *k = data;
+
+    g_free(k->name);
+    g_free(k);
+}
 
 
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(virNodeDeviceObjList, virObjectUnref);
@@ -74,6 +104,12 @@ redfishPrivateFree(redfishPrivate *priv)
     }
     virObjectUnref(priv->caps);
     virObjectUnref(priv->xmlopt);
+    if (priv->pollTimer >= 0)
+        virEventRemoveTimeout(priv->pollTimer);
+    virObjectUnref(priv->eventState);
+    g_clear_pointer(&priv->known, g_hash_table_unref);
+    virMutexDestroy(&priv->eventLock);
+    virMutexDestroy(&priv->startLock);
     virMutexDestroy(&priv->pathsLock);
     g_clear_pointer(&priv->pathByUUID, g_hash_table_unref);
     g_clear_pointer(&priv->pathByName, g_hash_table_unref);
@@ -443,7 +479,29 @@ redfishConnectOpen(virConnectPtr conn,
     priv = g_new0(redfishPrivate, 1);
     priv->pathByUUID = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
     priv->pathByName = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
-    if (virMutexInit(&priv->pathsLock) < 0) {
+    priv->known = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
+                                        redfishKnownSystemFree);
+    priv->pollTimer = -1;
+    priv->pollInterval = REDFISH_DEFAULT_POLL * 1000;
+    if ((param = redfishURIParam(conn->uri, "poll"))) {
+        unsigned int secs;
+
+        if (virStrToLong_ui(param, NULL, 10, &secs) < 0 || secs == 0 ||
+            secs > 3600) {
+            virReportError(VIR_ERR_INVALID_ARG,
+                           _("Invalid Redfish poll interval '%1$s'"), param);
+            redfishPrivateFree(g_steal_pointer(&priv));
+            return VIR_DRV_OPEN_ERROR;
+        }
+        priv->pollInterval = secs * 1000;
+    }
+    if (!(priv->eventState = virObjectEventStateNew())) {
+        redfishPrivateFree(g_steal_pointer(&priv));
+        return VIR_DRV_OPEN_ERROR;
+    }
+    if (virMutexInit(&priv->eventLock) < 0 ||
+        virMutexInit(&priv->startLock) < 0 ||
+        virMutexInit(&priv->pathsLock) < 0) {
         virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
                        _("Could not initialize mutex"));
         g_free(priv);
@@ -1320,6 +1378,239 @@ redfishDomainGetAutostart(virDomainPtr dom G_GNUC_UNUSED,
 }
 
 
+/* --- events -------------------------------------------------------------- */
+
+static void
+redfishEmit(redfishPrivate *priv,
+            const char *name,
+            int id,
+            const unsigned char *uuid,
+            int type,
+            int detail)
+{
+    virObjectEvent *ev = virDomainEventLifecycleNew(id, name, uuid, type, detail);
+
+    if (ev)
+        virObjectEventStateQueue(priv->eventState, ev);
+}
+
+
+/* Queue the events for the difference between two states of a system */
+static void
+redfishEmitTransition(redfishPrivate *priv,
+                      const redfishKnownSystem *old,
+                      const redfishKnownSystem *cur,
+                      const unsigned char *uuid)
+{
+    if (cur->state == old->state)
+        return;
+
+    if (cur->state == VIR_DOMAIN_RUNNING) {
+        if (old->state == VIR_DOMAIN_PAUSED)
+            redfishEmit(priv, cur->name, cur->id, uuid,
+                        VIR_DOMAIN_EVENT_RESUMED,
+                        VIR_DOMAIN_EVENT_RESUMED_UNPAUSED);
+        else
+            redfishEmit(priv, cur->name, cur->id, uuid,
+                        VIR_DOMAIN_EVENT_STARTED,
+                        VIR_DOMAIN_EVENT_STARTED_BOOTED);
+    } else if (cur->state == VIR_DOMAIN_SHUTOFF) {
+        redfishEmit(priv, cur->name, -1, uuid,
+                    VIR_DOMAIN_EVENT_STOPPED,
+                    VIR_DOMAIN_EVENT_STOPPED_SHUTDOWN);
+    } else if (cur->state == VIR_DOMAIN_PAUSED) {
+        redfishEmit(priv, cur->name, cur->id, uuid,
+                    VIR_DOMAIN_EVENT_SUSPENDED,
+                    VIR_DOMAIN_EVENT_SUSPENDED_PAUSED);
+    }
+    /* States such as "powering off" are not reported until they settle */
+}
+
+
+/*
+ * Read the composed systems and remember them. With @emit, queue events
+ * for what changed since the previous call. Failures are logged and
+ * otherwise ignored, so that a service which is briefly unreachable does
+ * not end event delivery.
+ */
+static int
+redfishEventsPoll(redfishPrivate *priv,
+                  bool emit)
+{
+    g_autoptr(GPtrArray) systems = NULL;
+    g_autoptr(GHashTable) fresh = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
+                                                        redfishKnownSystemFree);
+    GHashTableIter iter;
+    gpointer key;
+    gpointer value;
+    virErrorPtr orig_err;
+    size_t i;
+    int ret = 0;
+
+    virErrorPreserveLast(&orig_err);
+
+    if (!(systems = redfishFetchComposedSystems(priv))) {
+        VIR_WARN("Failed to poll Redfish service: %s", virGetLastErrorMessage());
+        ret = -1;
+        goto cleanup;
+    }
+
+    for (i = 0; i < systems->len; i++) {
+        virJSONValue *sys = g_ptr_array_index(systems, i);
+        redfishKnownSystem *k;
+        unsigned char uuid[VIR_UUID_BUFLEN];
+        char uuidstr[VIR_UUID_STRING_BUFLEN];
+
+        if (redfishSystemGetUUID(sys, uuid) < 0 || !redfishSystemGetName(sys)) {
+            virResetLastError();
+            continue;
+        }
+
+        virUUIDFormat(uuid, uuidstr);
+        k = g_new0(redfishKnownSystem, 1);
+        k->name = g_strdup(redfishSystemGetName(sys));
+        k->state = redfishSystemGetState(sys, NULL);
+        k->id = k->state == VIR_DOMAIN_SHUTOFF ? -1 : redfishSystemId(sys);
+        g_hash_table_replace(fresh, g_strdup(uuidstr), k);
+    }
+
+    VIR_WITH_MUTEX_LOCK_GUARD(&priv->eventLock) {
+        if (emit) {
+            g_hash_table_iter_init(&iter, fresh);
+            while (g_hash_table_iter_next(&iter, &key, &value)) {
+                const redfishKnownSystem *cur = value;
+                const redfishKnownSystem *old = g_hash_table_lookup(priv->known, key);
+                unsigned char uuid[VIR_UUID_BUFLEN];
+
+                ignore_value(virUUIDParse(key, uuid));
+                if (!old) {
+                    redfishEmit(priv, cur->name, cur->id, uuid,
+                                VIR_DOMAIN_EVENT_DEFINED,
+                                VIR_DOMAIN_EVENT_DEFINED_ADDED);
+                    if (cur->state == VIR_DOMAIN_RUNNING)
+                        redfishEmit(priv, cur->name, cur->id, uuid,
+                                    VIR_DOMAIN_EVENT_STARTED,
+                                    VIR_DOMAIN_EVENT_STARTED_BOOTED);
+                } else {
+                    redfishEmitTransition(priv, old, cur, uuid);
+                }
+            }
+
+            g_hash_table_iter_init(&iter, priv->known);
+            while (g_hash_table_iter_next(&iter, &key, &value)) {
+                const redfishKnownSystem *old = value;
+                unsigned char uuid[VIR_UUID_BUFLEN];
+
+                if (g_hash_table_contains(fresh, key))
+                    continue;
+
+                ignore_value(virUUIDParse(key, uuid));
+                if (old->state != VIR_DOMAIN_SHUTOFF)
+                    redfishEmit(priv, old->name, -1, uuid,
+                                VIR_DOMAIN_EVENT_STOPPED,
+                                VIR_DOMAIN_EVENT_STOPPED_DESTROYED);
+                redfishEmit(priv, old->name, -1, uuid,
+                            VIR_DOMAIN_EVENT_UNDEFINED,
+                            VIR_DOMAIN_EVENT_UNDEFINED_REMOVED);
+            }
+        }
+
+        g_hash_table_unref(priv->known);
+        priv->known = g_steal_pointer(&fresh);
+    }
+
+ cleanup:
+    virErrorRestore(&orig_err);
+    return ret;
+}
+
+
+static void
+redfishEventsTimer(int timer G_GNUC_UNUSED,
+                   void *opaque)
+{
+    redfishEventsPoll(opaque, true);
+}
+
+
+static int
+redfishEventsStart(redfishPrivate *priv)
+{
+    VIR_LOCK_GUARD lock = virLockGuardLock(&priv->startLock);
+
+    if (priv->nCallbacks == 0) {
+        /* Without a baseline everything would look new */
+        if (redfishEventsPoll(priv, false) < 0) {
+            virReportError(VIR_ERR_OPERATION_FAILED, "%s",
+                           _("Could not read the Redfish service to start watching it"));
+            return -1;
+        }
+
+        if ((priv->pollTimer = virEventAddTimeout(priv->pollInterval,
+                                                  redfishEventsTimer,
+                                                  priv, NULL)) < 0) {
+            virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
+                           _("Could not start polling, is an event loop running?"));
+            return -1;
+        }
+    }
+
+    priv->nCallbacks++;
+    return 0;
+}
+
+
+static void
+redfishEventsStop(redfishPrivate *priv)
+{
+    VIR_LOCK_GUARD lock = virLockGuardLock(&priv->startLock);
+
+    if (priv->nCallbacks > 0 && --priv->nCallbacks == 0 && priv->pollTimer >= 0) {
+        virEventRemoveTimeout(priv->pollTimer);
+        priv->pollTimer = -1;
+    }
+}
+
+
+static int
+redfishConnectDomainEventRegisterAny(virConnectPtr conn,
+                                     virDomainPtr dom,
+                                     int eventID,
+                                     virConnectDomainEventGenericCallback callback,
+                                     void *opaque,
+                                     virFreeCallback freecb)
+{
+    redfishPrivate *priv = conn->privateData;
+    int ret;
+
+    if (virDomainEventStateRegisterID(conn, priv->eventState, dom, eventID,
+                                      callback, opaque, freecb, &ret) < 0)
+        return -1;
+
+    if (redfishEventsStart(priv) < 0) {
+        virObjectEventStateDeregisterID(conn, priv->eventState, ret, false);
+        return -1;
+    }
+
+    return ret;
+}
+
+
+static int
+redfishConnectDomainEventDeregisterAny(virConnectPtr conn,
+                                       int callbackID)
+{
+    redfishPrivate *priv = conn->privateData;
+
+    if (virObjectEventStateDeregisterID(conn, priv->eventState,
+                                        callbackID, true) < 0)
+        return -1;
+
+    redfishEventsStop(priv);
+    return 0;
+}
+
+
 /* --- node devices -------------------------------------------------------- */
 
 /*
@@ -1607,6 +1898,8 @@ static virHypervisorDriver redfishHypervisorDriver = {
     .domainAttachDeviceFlags = redfishDomainAttachDeviceFlags, /* 12.10.0 */
     .domainDetachDevice = redfishDomainDetachDevice, /* 12.10.0 */
     .domainDetachDeviceFlags = redfishDomainDetachDeviceFlags, /* 12.10.0 */
+    .connectDomainEventRegisterAny = redfishConnectDomainEventRegisterAny, /* 12.10.0 */
+    .connectDomainEventDeregisterAny = redfishConnectDomainEventDeregisterAny, /* 12.10.0 */
     .domainGetAutostart = redfishDomainGetAutostart, /* 12.10.0 */
 };
 
