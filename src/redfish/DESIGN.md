@@ -497,8 +497,9 @@ Things which work but not as well as they should.
 - **Attach and detach rely on `PATCH`.** They assume a service which
   changes a system's blocks by `PATCH` on `Links.ResourceBlocks`. Services
   which do this through fabric endpoints are not supported.
-- **Not tested against a real service.** Only the mock server and the read
-  paths of DMTF's emulator have been used (see Testing).
+- **Not tested against a real service.** Only the mock server and DMTF's
+  emulator (with its composition switched on) have been used; neither is
+  real hardware or a BMC (see Testing).
 
 ## Not done by design
 
