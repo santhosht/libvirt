@@ -185,8 +185,10 @@ the pool only after the machine is powered off.
 ### 14. Two test services
 
 A small mock was written because no ready made service supported
-composition end to end. DMTF's Redfish Interface Emulator was used as an
-independent check of the read paths; it cannot compose (see Testing). The
+composition end to end. DMTF's Redfish Interface Emulator ships composing
+switched off, so it is used with `tests/dmtf-emulator-composition.patch`
+(see Testing): an independent implementation, which found several
+problems the mock could not, but one which cannot attach or detach. The
 mock carries the implementer's reading of the specification, so a real
 service is still the real test.
 
@@ -695,4 +697,6 @@ want to revisit.
 4. Replace polling with the service's server-sent events where it offers
    them, for prompt events and no idle traffic.
 5. Decide how domains are named when a service ignores the requested name.
-6. Try a real service and fix what differs.
+6. Skip members which vanish between listing and reading, instead of
+   failing the whole listing.
+7. Try a real service and fix what differs.
