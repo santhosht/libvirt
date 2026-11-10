@@ -211,6 +211,9 @@ src/qemu/qemu_vhost_user.c
 src/qemu/qemu_vhost_user_gpu.c
 src/qemu/qemu_virtiofs.c
 src/qemu/qemu_vnc.c
+src/redfish/redfish_client.c
+src/redfish/redfish_conv.c
+src/redfish/redfish_driver.c
 src/remote/libvirtd.policy.in
 src/remote/remote_daemon.c
 src/remote/remote_daemon_config.c

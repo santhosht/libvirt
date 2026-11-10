@@ -127,6 +127,12 @@ else
   sym_files += 'libvirt_hyperv.syms'
 endif
 
+if conf.has('WITH_REDFISH')
+  used_sym_files += 'libvirt_redfish.syms'
+else
+  sym_files += 'libvirt_redfish.syms'
+endif
+
 # variables filled by subdirectories
 
 libvirt_libs = []
@@ -280,6 +286,7 @@ subdir('lxc')
 subdir('ch')
 subdir('openvz')
 subdir('qemu')
+subdir('redfish')
 subdir('test')
 subdir('vbox')
 subdir('vmware')

@@ -82,6 +82,8 @@ option('qemu_user', type: 'string', value: '', description: 'username to run QEM
 option('qemu_group', type: 'string', value: '', description: 'groupname to run QEMU system instance as')
 option('qemu_moddir', type: 'string', value: '', description: 'set the directory where QEMU modules are located')
 option('qemu_datadir', type: 'string', value: '', description: 'set the directory where QEMU shared data is located')
+# dep:curl dep:json_c
+option('driver_redfish', type: 'feature', value: 'auto', description: 'Redfish composable infrastructure driver')
 option('driver_test', type: 'feature', value: 'auto', description: 'test driver')
 option('driver_vbox', type: 'feature', value: 'auto', description: 'VirtualBox XPCOMC driver')
 option('vbox_xpcomc_dir', type: 'string', value: '', description: 'Location of directory containing VirtualBox XPCOMC library')

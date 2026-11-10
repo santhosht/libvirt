@@ -1535,6 +1535,12 @@ elif get_option('driver_hyperv').enabled()
   error('openwsman is required for the Hyper-V driver')
 endif
 
+if not get_option('driver_redfish').disabled() and curl_dep.found() and json_c_dep.found()
+  conf.set('WITH_REDFISH', 1)
+elif get_option('driver_redfish').enabled()
+  error('curl and json-c are required for the Redfish driver')
+endif
+
 if not get_option('driver_interface').disabled() and conf.has('WITH_LIBVIRTD') and (udev_dep.found() or conf.has('WITH_NETCF'))
   conf.set('WITH_INTERFACE', 1)
 elif get_option('driver_interface').enabled()
@@ -2280,6 +2286,7 @@ driver_summary = {
   'NWFilter': conf.has('WITH_NWFILTER'),
   'OpenVZ': conf.has('WITH_OPENVZ'),
   'QEMU': conf.has('WITH_QEMU'),
+  'Redfish': conf.has('WITH_REDFISH'),
   'Remote': conf.has('WITH_REMOTE'),
   'Storage': conf.has('WITH_STORAGE'),
   'Test': conf.has('WITH_TEST'),

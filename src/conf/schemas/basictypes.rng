@@ -736,6 +736,7 @@
         <value>vz</value>
         <value>bhyve</value>
         <value>hvf</value>
+        <value>redfish</value>
       </choice>
     </attribute>
   </define>

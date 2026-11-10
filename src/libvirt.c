@@ -72,6 +72,9 @@
 #ifdef WITH_HYPERV
 # include "hyperv/hyperv_driver.h"
 #endif
+#ifdef WITH_REDFISH
+# include "redfish/redfish_driver.h"
+#endif
 #ifdef WITH_BHYVE
 # include "bhyve/bhyve_driver.h"
 #endif
@@ -277,6 +280,10 @@ virGlobalInit(void)
 #endif
 #ifdef WITH_HYPERV
     if (hypervRegister() == -1)
+        goto error;
+#endif
+#ifdef WITH_REDFISH
+    if (redfishRegister() == -1)
         goto error;
 #endif
 #ifdef WITH_REMOTE
@@ -1097,6 +1104,9 @@ virConnectOpenInternal(const char *name,
 #endif
 #ifndef WITH_HYPERV
              STRCASEEQ(ret->uri->scheme, "hyperv") ||
+#endif
+#ifndef WITH_REDFISH
+             STRCASEEQ(ret->uri->scheme, "redfish") ||
 #endif
 #ifndef WITH_VZ
              STRCASEEQ(ret->uri->scheme, "parallels") ||
