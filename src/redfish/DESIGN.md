@@ -352,6 +352,8 @@ connection. Nothing is cached between connections or written to disk.
 
 - Collections that keep members under `Links.Members` (older RSD style) are
   accepted as well as the standard `Members`.
+- A successful reply to anything but a read may have a body which is not
+  JSON; it is ignored. Errors given as `{"error": "text"}` are shown too.
 - `Reserved` given as a string is tolerated.
 - Not implemented: `$expand`, which would let a collection and its members
   come back in one request on services that support it.
@@ -427,9 +429,32 @@ python3 tests/redfish-mock-server.py --port 18001 --task-delay 2
 ```
 
 It encodes this driver's reading of the specification, so it cannot show
-where a real service differs. The DMTF Redfish Interface Emulator was tried
-for the read paths (connect, node devices, systems); its `POST /Systems`
-always answers 405, so composing cannot be tested with it.
+where another service differs. For that the driver is also run against
+DMTF's Redfish Interface Emulator, an independent implementation.
+
+The emulator (release 1.2.2) ships composing and decomposing switched off.
+`tests/dmtf-emulator-composition.patch` turns DMTF's own composition code
+back on and supplies the values its template needs (see the patch header
+for how to apply and run it). With it, against the emulator:
+
+| Works | Does not |
+| --- | --- |
+| connect, node devices and their types | attach and detach: its `PATCH` accepts only `Name`, `HostName`, `AssetTag`, `SerialNumber` and `UUID` |
+| compose, list, dumpxml, dominfo | naming the machine as asked (see below) |
+| start, destroy | |
+| undefine (decomposes, blocks become free again) | |
+| lifecycle events | |
+
+What running against it showed, and what was changed because of it:
+
+- Its `Collection.Members` for resource blocks sits under `Links`; the
+  driver now accepts that layout.
+- It redirects `/redfish/v1` to `/redfish/v1/`; the driver now follows it.
+- It answers a successful `DELETE` with a body which is not JSON, and
+  errors as `{"error": "text"}`; the driver now accepts the first and
+  shows the text of the second.
+- It ignores the requested `Name` and calls every new system "My Computer
+  System", using the name as the system's `Id`. See Known weaknesses.
 
 Events were tested with one `virsh event` process listening while other
 `virsh` commands defined, started, stopped and removed a machine.
@@ -445,8 +470,7 @@ the guard was needed. The C program is not part of the repository.
 
 Not yet covered: automated tests, and any real service or BMC. DMTF's
 published mockup bundle could not be downloaded from here (the server
-refuses automated clients), so no independent composability data has been
-run through the driver.
+refuses automated clients).
 
 ## Known weaknesses
 
@@ -458,6 +482,15 @@ Things which work but not as well as they should.
 - **Slow on large services.** Listing domains reads every system and
   listing node devices reads every block, one request each. On a service
   with many of them this will be slow until `$expand` is supported.
+- **Domain names come from the system's `Name`.** The driver composes with
+  the name given in the XML and afterwards finds the machine by the `Name`
+  the service reports. A service which ignores the requested name, as DMTF's
+  emulator does (it uses the name as `Id` and gives every system the same
+  `Name`), leaves a domain with another name than the one defined, and
+  several such systems would share one name. `Id` is the field Redfish
+  guarantees unique. Choices: keep `Name`; use `Id`, which changes the
+  names seen with services that honour `Name`; or use `Name` and fall back
+  to `Id` when it is not unique. Not decided.
 - **Late and lossy events.** Events are polled (decision 12), so they
   arrive up to one `poll` interval late and a change which comes and goes
   within one interval is missed. Only domain lifecycle events exist.
@@ -493,4 +526,5 @@ want to revisit.
 3. `$expand` where the service announces it.
 4. Replace polling with the service's server-sent events where it offers
    them, for prompt events and no idle traffic.
-5. Try a real service and fix what differs.
+5. Decide how domains are named when a service ignores the requested name.
+6. Try a real service and fix what differs.

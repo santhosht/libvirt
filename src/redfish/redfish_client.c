@@ -285,7 +285,8 @@ redfishClientPerform(redfishClient *client,
 static virJSONValue *
 redfishResponseParse(redfishResponse *resp,
                      const char *method,
-                     const char *path)
+                     const char *path,
+                     bool required)
 {
     const char *content = virBufferCurrentContent(&resp->body);
     virJSONValue *json;
@@ -294,9 +295,16 @@ redfishResponseParse(redfishResponse *resp,
         return NULL;
 
     if (!(json = virJSONValueFromString(content))) {
-        virReportError(VIR_ERR_INTERNAL_ERROR,
-                       _("Malformed JSON in reply to Redfish request %1$s %2$s"),
-                       method, path);
+        /* The body of a successful reply to something other than a read
+         * is optional, and some services put plain text in it. The
+         * status says what happened, so don't turn it into a failure. */
+        if (required)
+            virReportError(VIR_ERR_INTERNAL_ERROR,
+                           _("Malformed JSON in reply to Redfish request %1$s %2$s"),
+                           method, path);
+        else
+            VIR_DEBUG("Ignoring body which is not JSON in reply to %s %s",
+                      method, path);
         return NULL;
     }
 
@@ -315,7 +323,15 @@ redfishErrorMessage(virJSONValue *reply)
     virJSONValue *msg;
     const char *str;
 
-    if (!reply || !(err = virJSONValueObjectGetObject(reply, "error")))
+    if (!reply)
+        return NULL;
+
+    /* Not every service follows the Redfish error format; some answer
+     * {"error": "text"} */
+    if ((str = virJSONValueObjectGetString(reply, "error")))
+        return str;
+
+    if (!(err = virJSONValueObjectGetObject(reply, "error")))
         return NULL;
 
     if ((info = virJSONValueObjectGetArray(err, "@Message.ExtendedInfo")) &&
@@ -381,8 +397,12 @@ redfishClientRequestLocked(redfishClient *client,
             return -1;
     }
 
-    json = redfishResponseParse(resp, method, path);
-    if (!json && virBufferUse(&resp->body) > 0 && *status < 400)
+    /* Error replies get their text from the body when it can be read.
+     * Reads need a body, anything else may do without. */
+    json = redfishResponseParse(resp, method, path,
+                                *status < 400 && STREQ(method, "GET"));
+    if (!json && virBufferUse(&resp->body) > 0 && *status < 400 &&
+        STREQ(method, "GET"))
         return -1;
 
     if (*status >= 400) {
@@ -619,7 +639,7 @@ redfishClientLogin(redfishClient *client,
 
         if (status == 401 || status == 403 || status == 400) {
             g_autoptr(virJSONValue) json = redfishResponseParse(&resp, "POST",
-                                                                sessionsPath);
+                                                                sessionsPath, false);
             const char *msg = redfishErrorMessage(json);
             virReportError(VIR_ERR_AUTH_FAILED,
                            _("Redfish login as '%1$s' failed: %2$s"),

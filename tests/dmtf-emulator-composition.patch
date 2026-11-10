@@ -1,0 +1,82 @@
+# Turns on the composition code of DMTF's Redfish-Interface-Emulator.
+#
+# Release 1.2.2 (commit 5f51d8a) ships composing and decomposing systems
+# switched off: POST on /redfish/v1/Systems and DELETE on a system return
+# 405 as their first statement, and the working code behind them is
+# unreachable. This patch removes those two returns, calls the emulator's
+# own CreateComposedSystem for the POST, and supplies the uuid, sno and
+# sku values its system template needs, which that code never passed.
+#
+# It changes nothing else; the composition logic is DMTF's.
+# Emulator: https://github.com/DMTF/Redfish-Interface-Emulator (BSD-3-Clause)
+#
+# Use:  git clone https://github.com/DMTF/Redfish-Interface-Emulator
+#       cd Redfish-Interface-Emulator && git checkout 5f51d8a
+#       git apply /path/to/tests/dmtf-emulator-composition.patch
+#       pip install Flask flask_restful flask_httpauth requests StringGenerator
+#       PORT=5000 python emulator.py -port 5000
+#
+diff --git a/api_emulator/redfish/ComputerSystem_api.py b/api_emulator/redfish/ComputerSystem_api.py
+index f2d3758..a782a9f 100644
+--- a/api_emulator/redfish/ComputerSystem_api.py
++++ b/api_emulator/redfish/ComputerSystem_api.py
+@@ -136,7 +136,6 @@ class ComputerSystemAPI(Resource):
+     # HTTP DELETE
+     def delete(self, ident):
+         logging.info('ComputerSystemAPI DELETE called')
+-        return 'DELETE is not a supported command for ComputerSystemAPI', 405
+         try:
+             if ident in members:
+                 if 'SystemType' in members[ident] and members[ident]['SystemType'] == 'Composed':
+@@ -248,34 +247,15 @@ class ComputerSystemCollectionAPI(Resource):
+     # TODO: May need an update for composed systems.
+     def post(self):
+         logging.info('ComputerSystemCollectionAPI POST called')
+-        return 'POST is not a supported command for ChassisCollectionAPI', 405
+         try:
+-            config = request.get_json(force=True)
+-            ok, msg = self.verify(config)
+-            if ok:
+-                config["@odata.id"]= "/redfish/v1/Systems/"+ config['Id']
+-                members[config['Id']] = config
+-                resp = config, 201
+-            else:
+-                resp = msg, 400
++            req = request.get_json(force=True)
++            composed = CreateComposedSystem(req)
++            if isinstance(composed, dict):
++                return composed, 201, {'Location': composed['@odata.id']}
++            return "Unable to compose the system", 400
+         except Exception:
+             traceback.print_exc()
+-            resp = "Internal Server Error", INTERNAL_ERROR
+-
+-        return resp
+-
+-        '''
+-        resp = INTERNAL_ERROR
+-        req = request.get_json()
+-
+-        if req is not None:
+-            composed_system = CreateComposedSystem(req)
+-            resp = composed_system, 200
+-        else:
+-            resp = INTERNAL_ERROR
+-
+-        return resp
+-        '''
++            return "Internal Server Error", INTERNAL_ERROR
+ 
+     # HTTP PATCH
+     def patch(self):
+@@ -364,7 +344,9 @@ def CreateComposedSystem(req):
+             if req['Name'] not in members.keys():
+ 
+                 # Create Composed System
+-                new_system = CreateComputerSystem(resource_class_kwargs={'rb': g.rest_base, 'linkChassis': [], 'linkMgr': None})
++                import uuid as _uuid
++                new_system = CreateComputerSystem(resource_class_kwargs={'rb': g.rest_base, 'linkChassis': [], 'linkMgr': None,
++                                                                          'uuid': str(_uuid.uuid4()), 'sno': 'COMPOSED-' + req['Name'], 'sku': 'composed'})
+                 new_system.put(req['Name'])
+ 
+                 # Remove unecessary Links and add ResourceBlocks to Links (this is a bit of a hack though)
