@@ -1,0 +1,309 @@
+# Redfish driver design
+
+A libvirt driver that manages composable bare metal through a DMTF Redfish
+composition service (DSP0266, DSP0268, DSP2050), using the libvirt API and
+tools such as `virsh`.
+
+It is a client-side driver, like ESX and Hyper-V. It runs inside the calling
+process, not in `libvirtd`, and talks to the service over HTTP(S).
+
+## Goals and non-goals
+
+Goals
+
+- Manage composed machines with the same commands used for virtual machines:
+  define, start, stop, reboot, undefine, attach and detach.
+- Show the pool of composable hardware (resource blocks) as node devices.
+- Keep no state of its own. The Redfish service is the only source of truth.
+
+Non-goals (for now)
+
+- Push notifications. Events are produced by polling (see Events), not by
+  subscribing to the service's server-sent events.
+- Anything that needs a hypervisor: console, migration, snapshots, save.
+- Creating or changing fabric connections (`/redfish/v1/Fabrics`).
+- Automatic placement. The caller names the exact blocks to compose.
+
+## Concept mapping
+
+| libvirt | Redfish |
+| --- | --- |
+| connection | session on the service (`/redfish/v1/SessionService/Sessions`) |
+| domain | `ComputerSystem` with `SystemType` of `Composed` |
+| `define` / `create` | specific composition: `POST /redfish/v1/Systems` |
+| `start` | `ComputerSystem.Reset` with `On` |
+| `destroy` | `ComputerSystem.Reset` with `ForceOff` |
+| `shutdown` | `ComputerSystem.Reset` with `GracefulShutdown` |
+| `reboot` | `ComputerSystem.Reset` with `GracefulRestart` |
+| `reset` | `ComputerSystem.Reset` with `ForceRestart` |
+| `undefine` | `DELETE` on the system (decomposition), only when powered off |
+| `attach-device` / `detach-device` | `PATCH` of `Links.ResourceBlocks` on the system |
+| node device | `ResourceBlock` |
+
+Systems that are not `Composed` (for example a management node) are never
+shown as domains.
+
+## Source layout
+
+| File | Responsibility |
+| --- | --- |
+| `redfish_client.c` | HTTP client: curl, sessions, error decoding, redirects, task monitor polling |
+| `redfish_conv.c` | Pure conversions between Redfish JSON and libvirt objects. No network access |
+| `redfish_driver.c` | The libvirt driver entry points and the logic that ties the two together |
+
+Changes outside this directory: the `redfish` domain virt type
+(`domain_conf`), the `VIR_FROM_REDFISH` error domain, registration in
+`libvirt.c`, the `driver_redfish` meson option and the domain schema.
+
+## Connecting
+
+```
+redfish://[user@]host[:port]/?transport=http|https&no_verify=1&timeout=SECS&poll=SECS
+```
+
+- `transport` defaults to `https`; the port defaults to 443 or 80.
+- `no_verify=1` turns off certificate checking. Off by default.
+- `timeout` is how long to wait for an asynchronous operation. Default 600.
+- `poll` is how often to check for changes while somebody listens for
+  events, 1 to 3600 seconds. Default 5.
+- Passwords are never part of the URI. They come from libvirt's usual
+  authentication (`auth.conf` / `LIBVIRT_AUTH_FILE`, or a prompt).
+
+On connect the driver reads the service root (allowed without
+authentication), creates a session with the credentials, and discovers the
+`Systems` and `CompositionService/ResourceBlocks` paths. If the service has
+no session service, it falls back to HTTP Basic authentication. On
+disconnect it deletes the session.
+
+## Domains
+
+### Domain XML
+
+```xml
+<domain type='redfish' xmlns:redfish='http://libvirt.org/schemas/domain/redfish/1.0'>
+  <name>ai-node-01</name>
+  <os><type arch='x86_64'>hvm</type><boot dev='network'/></os>
+  <redfish:composition>
+    <redfish:block name='Compute1'/>
+    <redfish:block name='GPU1'/>
+  </redfish:composition>
+</domain>
+```
+
+When defining, only these are used:
+
+- `<name>` and `<description>`
+- `<boot dev=...>`, sent as a boot override (`network` becomes `Pxe`,
+  `cdrom` becomes `Cd`; `hd` is the default and sends nothing)
+- the `<redfish:block>` names, which must match node device names
+
+`<memory>`, `<vcpu>` and `<uuid>` are **ignored**. The machine gets what its
+blocks provide, and the service assigns the UUID.
+
+When dumping, the XML is built from the live system:
+
+- CPUs: `ProcessorSummary.LogicalProcessorCount`, then `CoreCount`, then
+  `Count`, else 1
+- memory: `MemorySummary.TotalSystemMemoryGiB`
+- UUID: the system's `UUID`; if missing or invalid, a stable UUID derived
+  from the system's URL
+- each `<redfish:block>` gets a `type` (`pci`, `storage`, `system`) and a
+  `description`, taken from the block and its parts. Both are output only
+
+The driver trusts the service's summaries and does not add up the blocks
+itself.
+
+### Power state mapping
+
+| `PowerState` | libvirt state |
+| --- | --- |
+| `On`, `PoweringOn` | running |
+| `PoweringOff` | shutdown |
+| `Paused` | paused |
+| `Off` | shut off |
+| anything else | no state |
+
+Composed systems are always persistent. The domain ID is a hash of the
+system's URL, stable but not meaningful, and only shown while powered on.
+
+### Compose flow
+
+1. Parse the XML and check `type='redfish'`.
+2. Read the ResourceBlocks collection and turn each `name` into its URL.
+3. `POST /redfish/v1/Systems` with `Name`, `Links.ResourceBlocks` and the
+   boot override.
+4. If the service answers `202 Accepted`, poll the task monitor until it is
+   done (see below), then read the created system from `Location`.
+
+`virDomainCreateXML` composes and then powers on; if powering on fails, it
+decomposes again so that no half composed hardware is left.
+
+### Attach and detach
+
+Device XML carries the block name in the alias:
+
+```xml
+<hostdev mode='subsystem' type='pci'><alias name='GPU2'/></hostdev>
+<disk type='network' device='disk'><alias name='NVMe1'/></disk>
+```
+
+Only the alias is read. libvirt's regular device parser cannot be used: it
+requires a PCI source address, which an unattached block does not have.
+Only `<hostdev>` and `<disk>` are accepted.
+
+The driver reads the system's current block list, adds or removes the one
+block, and `PATCH`es the full list back (a Redfish array is replaced as a
+whole). Whether that is allowed, for instance while the machine is on, is
+decided by the service, and its error message is passed on. A composed
+machine has a single state, so the live and config flags mean the same thing.
+
+## Node devices
+
+Each ResourceBlock is a node device named after the last part of its URL,
+with characters other than letters, digits, `-`, `_` and `.` replaced.
+
+| Block | Device capability |
+| --- | --- |
+| type `Compute` or `Memory` | `system` |
+| type `Storage` | `storage` |
+| type `Expansion` | `pci` |
+| no decisive type (e.g. only `Processor`, or no type at all) | decided by its parts: an accelerator makes it `pci`, a drive `storage`, else `system` |
+
+PCI devices have no bus address, since a free block is attached to no host.
+The device `<path>` is the block's Redfish URL.
+
+## Talking to the service
+
+### Requests
+
+- A response of `202` with a `Location` is followed through the task
+  monitor, polling every 1 to 10 seconds (honouring `Retry-After`), until the
+  timeout.
+- Redirects on the same service are followed by hand (`/redfish/v1` to
+  `/redfish/v1/` is common). Redirects to another host are refused, so the
+  session token is never sent elsewhere.
+- Errors use the service's own message (`@Message.ExtendedInfo` or
+  `error.message`). HTTP 401 and 403 become an authentication failure.
+- One request is made at a time per connection.
+
+### Keeping requests down
+
+- Listing node devices reads the collection and each block once. Parts
+  (processors, memory, drives) are read only for blocks whose own type does
+  not decide the device kind.
+- `nodedev-dumpxml` reads only its own block and that block's parts. Looking
+  a device up by name reads only the collection.
+- Finding a system by name or UUID tries the location remembered from the
+  last listing on the same connection (one request, verified against the
+  result). On a miss it reads systems one by one and stops at the match.
+- `dumpxml` reads each block and its parts to describe them.
+
+The remembered locations live only in memory for the length of the
+connection. Nothing is cached between connections or written to disk.
+
+### Compatibility
+
+- Collections that keep members under `Links.Members` (older RSD style) are
+  accepted as well as the standard `Members`.
+- `Reserved` given as a string is tolerated.
+- Not implemented: `$expand`, which would let a collection and its members
+  come back in one request on services that support it.
+
+## Events
+
+The driver supports domain lifecycle events (`virsh event --all --loop`,
+or any libvirt client registering for them). Redfish has no change
+notification that fits through this connection, so while at least one
+listener is registered the driver polls the composed systems and turns the
+differences into events:
+
+| Change seen | Event |
+| --- | --- |
+| new system | Defined / Added (and Started / Booted if it is on) |
+| powered on | Started / Booted |
+| unpaused | Resumed / Unpaused |
+| powered off | Stopped / Shutdown |
+| paused | Suspended / Paused |
+| system gone | Stopped / Destroyed if it was on, then Undefined / Removed |
+
+Details
+
+- Registering reads the service once to get a baseline, so existing
+  machines do not all show up as new. Polling starts with the first
+  listener and stops with the last; with no listeners nothing is polled.
+- Changes between two polls are merged: a machine turned on and off within
+  one interval produces no events.
+- States such as "powering off" are not reported until they settle.
+- A failed poll is logged and the next one tries again, so a brief outage
+  does not end event delivery.
+- Polling runs in the caller's event loop (libvirt's default implementation
+  in `virsh`), so a slow service delays other work in that loop. The caller
+  must have registered an event loop, otherwise registering fails.
+- Events are only seen by the process that listens. Changes are noticed
+  whoever made them, but only while a listener is running.
+
+## Errors
+
+| Situation | libvirt error |
+| --- | --- |
+| bad URI, unknown transport, bad timeout | `VIR_ERR_INVALID_ARG` |
+| login refused, HTTP 401 or 403 | `VIR_ERR_AUTH_FAILED` |
+| other HTTP errors, network failures | `VIR_ERR_OPERATION_FAILED` |
+| task did not finish in time | `VIR_ERR_OPERATION_TIMEOUT` |
+| unknown domain | `VIR_ERR_NO_DOMAIN` |
+| unknown block or node device | `VIR_ERR_NO_NODE_DEVICE` |
+| block not on the machine (detach) | `VIR_ERR_DEVICE_MISSING` |
+| wrong power state, block already attached | `VIR_ERR_OPERATION_INVALID` |
+| bad domain or device XML | `VIR_ERR_XML_ERROR` |
+
+## Testing
+
+`tests/redfish-mock-server.py` is a small in-memory composition service:
+sessions and Basic auth, 8 resource blocks (3 compute, 2 GPU, 1 CXL memory,
+2 NVMe), composition with an optional delay through a task monitor, power
+actions, decomposition and block changes by `PATCH`.
+
+```bash
+python3 tests/redfish-mock-server.py --port 18001 --task-delay 2
+# --no-auth         no authentication
+# --hot-plug        allow block changes while a machine is on
+# --task-delay 0    composition answers immediately with 201
+```
+
+It encodes this driver's reading of the specification, so it cannot show
+where a real service differs. The DMTF Redfish Interface Emulator was tried
+for the read paths (connect, node devices, systems); its `POST /Systems`
+always answers 405, so composing cannot be tested with it.
+
+Events were tested with one `virsh event` process listening while other
+`virsh` commands defined, started, stopped and removed a machine.
+
+Not yet covered: automated tests, and any real service or BMC. DMTF's
+published mockup bundle could not be downloaded from here (the server
+refuses automated clients), so no independent composability data has been
+run through the driver.
+
+## Known limitations
+
+- Events are polled, so they arrive up to one `poll` interval late and short
+  lived changes can be missed. Only domain lifecycle events exist.
+- `<memory>`, `<vcpu>` and `<uuid>` in the XML are accepted but ignored.
+- Domain list and state need one read per system, and node device listing
+  one per block. This will be slow on a service with very many of them
+  until `$expand` is supported.
+- Suspend, resume, autostart, screenshots, consoles and the rest of the
+  hypervisor API are not provided.
+- Attach and detach assume a service that accepts `PATCH` on
+  `Links.ResourceBlocks`. Services that do this through fabric endpoints
+  are not supported.
+
+## Possible next steps
+
+1. Automated tests for the conversion code and a scripted run against the
+   mock server.
+2. Replace polling with the service's server-sent events where it offers
+   them, for prompt events and no idle traffic.
+3. `$expand` where the service announces it.
+4. Reject or warn about `<memory>` and `<vcpu>` which do not match the
+   composed hardware.
+5. Try a real service and fix what differs.
