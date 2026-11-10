@@ -430,27 +430,55 @@ published mockup bundle could not be downloaded from here (the server
 refuses automated clients), so no independent composability data has been
 run through the driver.
 
-## Known limitations
+## Known weaknesses
 
-- Events are polled, so they arrive up to one `poll` interval late and short
-  lived changes can be missed. Only domain lifecycle events exist.
-- `<memory>`, `<vcpu>` and `<uuid>` in the XML are accepted but ignored.
-- Domain list and state need one read per system, and node device listing
-  one per block. This will be slow on a service with very many of them
-  until `$expand` is supported.
-- Suspend, resume, autostart, screenshots, consoles and the rest of the
-  hypervisor API are not provided.
-- Attach and detach assume a service that accepts `PATCH` on
-  `Links.ResourceBlocks`. Services that do this through fabric endpoints
-  are not supported.
+Things which work but not as well as they should.
+
+- **Silently ignored XML.** `<memory>`, `<vcpu>` and `<uuid>` are accepted
+  and ignored when defining, so the XML can say 1 CPU while the machine
+  gets 224. A warning or an error is better (decision 7).
+- **Slow on large services.** Listing domains reads every system and
+  listing node devices reads every block, one request each. On a service
+  with many of them this will be slow until `$expand` is supported.
+- **Late and lossy events.** Events are polled (decision 12), so they
+  arrive up to one `poll` interval late and a change which comes and goes
+  within one interval is missed. Only domain lifecycle events exist.
+- **Possible race when closing a connection.** The polling timer holds a
+  pointer to the connection's private data. Closing removes the timer, but
+  does not wait for a callback that is already running. This is unlikely
+  in `virsh`, which runs one thread, but has not been shown safe for
+  programs which close connections from another thread.
+- **Attach and detach rely on `PATCH`.** They assume a service which
+  changes a system's blocks by `PATCH` on `Links.ResourceBlocks`. Services
+  which do this through fabric endpoints are not supported.
+- **Not tested against a real service.** Only the mock server and the read
+  paths of DMTF's emulator have been used (see Testing).
+
+## Not done by design
+
+Left out on purpose. They are not bugs, but they are choices someone may
+want to revisit.
+
+- **Hardware is not shown in `<devices>`.** Blocks appear only under
+  `<redfish:composition>`, as a block has no PCI address (decision 5).
+- **Most of the hypervisor API is missing.** There are no suspend, resume,
+  console, screenshot, snapshot, save, migration or autostart commands. A
+  composed machine has no hypervisor behind it to provide them.
+- **No fabric or connection management.** The driver composes with blocks
+  that already exist and does not change fabric connections (a non-goal).
+- **No automatic placement.** The caller names the exact blocks.
+- **No upstream extras.** No NEWS entry, no pages under `docs/`, and no
+  attempt to follow upstream's patch rules. The driver is not meant to be
+  sent to the libvirt project.
 
 ## Possible next steps
 
 1. Automated tests for the conversion code and a scripted run against the
    mock server.
-2. Replace polling with the service's server-sent events where it offers
-   them, for prompt events and no idle traffic.
+2. Warn or fail when `<memory>` or `<vcpu>` do not match the composed
+   hardware.
 3. `$expand` where the service announces it.
-4. Reject or warn about `<memory>` and `<vcpu>` which do not match the
-   composed hardware.
-5. Try a real service and fix what differs.
+4. Replace polling with the service's server-sent events where it offers
+   them, for prompt events and no idle traffic.
+5. Make closing a connection wait for a running poll.
+6. Try a real service and fix what differs.
