@@ -1,0 +1,45 @@
+#!/bin/bash
+# virsh wrapper for the Redfish driver.
+#
+#   rf [-s SERVER] VIRSH-ARGS...
+#
+# SERVER is "mock" (default, tests/redfish-mock-server.py on port 18001),
+# "emulator" (DMTF's emulator on port 5000), or a full connection URI such
+# as "redfish://admin@bmc.example.com/?transport=https&no_verify=1".
+#
+# Credentials come from libvirt's auth file; by default the sample
+# auth.conf next to this script (user admin, password "password", which is
+# what both local servers accept). Override with LIBVIRT_AUTH_FILE.
+#
+# Environment:
+#   REDFISH_BUILD_DIR     meson build directory (default: <repo>/build)
+#   REDFISH_INTERACTIVE=1 keep stdin, so that virsh can ask for a password
+#                         or run its shell
+
+here=$(cd "$(dirname "$0")" && pwd)
+root=$(cd "$here/../.." && pwd)
+build=${REDFISH_BUILD_DIR:-$root/build}
+
+server=mock
+if [ "$1" = "-s" ]; then
+    server=$2
+    shift 2
+fi
+
+case "$server" in
+    mock)     uri="redfish://admin@127.0.0.1:${MOCK_PORT:-18001}/?transport=http" ;;
+    emulator) uri="redfish://admin@127.0.0.1:${EMULATOR_PORT:-5000}/?transport=http" ;;
+    *)        uri=$server ;;
+esac
+
+export LIBVIRT_AUTH_FILE=${LIBVIRT_AUTH_FILE:-$here/auth.conf}
+
+if [ ! -x "$build/run" ] || [ ! -x "$build/tools/virsh" ]; then
+    echo "rf: no build found in $build (see 'Running it' in src/redfish/DESIGN.md)" >&2
+    exit 2
+fi
+
+if [ -n "$REDFISH_INTERACTIVE" ]; then
+    exec "$build/run" "$build/tools/virsh" -c "$uri" "$@"
+fi
+exec "$build/run" "$build/tools/virsh" -c "$uri" "$@" </dev/null

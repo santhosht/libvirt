@@ -137,6 +137,12 @@ redfishDomainDefPostParse(virDomainDef *def,
     if (def->os.arch == VIR_ARCH_NONE)
         def->os.arch = VIR_ARCH_X86_64;
 
+    /* The memory comes from the resource blocks, so the XML need not say
+     * how much. libvirt insists on a size, and checks for it after this
+     * callback, so give it a placeholder. */
+    if (virDomainDefGetMemoryTotal(def) == 0)
+        virDomainDefSetMemoryTotal(def, 1024 * 1024);
+
     return 0;
 }
 

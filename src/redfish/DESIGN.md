@@ -245,7 +245,8 @@ When defining, only these are used:
 - the `<redfish:block>` names, which must match node device names
 
 `<memory>`, `<vcpu>` and `<uuid>` are **ignored**. The machine gets what its
-blocks provide, and the service assigns the UUID.
+blocks provide, and the service assigns the UUID. `<memory>` may be left
+out: libvirt insists on a size, so the driver supplies a placeholder.
 
 When dumping, the XML is built from the live system:
 
@@ -413,6 +414,166 @@ Details
 | wrong power state, block already attached | `VIR_ERR_OPERATION_INVALID` |
 | bad domain or device XML | `VIR_ERR_XML_ERROR` |
 
+## Running it
+
+### Build
+
+libvirt's usual dependencies are needed. On Debian or Ubuntu these were
+enough:
+
+```bash
+apt-get install meson ninja-build pkg-config libglib2.0-dev libxml2-dev \
+    libxml2-utils libgnutls28-dev libcurl4-gnutls-dev libjson-c-dev xsltproc \
+    python3-docutils libtirpc-dev libnl-3-dev libnl-route-3-dev \
+    libdevmapper-dev libpciaccess-dev libudev-dev libyajl-dev gettext \
+    libreadline-dev bash-completion
+```
+
+The driver needs libcurl and json-c, and is picked up automatically when
+both are present. To force it, so that a missing library is an error:
+
+```bash
+meson setup build -Ddocs=disabled -Dtests=enabled -Ddriver_redfish=enabled
+ninja -C build
+```
+
+Run `virsh` from the build directory without installing, through
+`build/run`:
+
+```bash
+build/run build/tools/virsh -c "redfish://admin@127.0.0.1:18001/?transport=http" version
+```
+
+### Local test servers
+
+`tests/redfish/servers.sh` starts, stops and checks both:
+
+```bash
+tests/redfish/servers.sh start all      # or: mock | emulator
+tests/redfish/servers.sh status
+tests/redfish/servers.sh stop all
+```
+
+**Mock server** (`tests/redfish-mock-server.py`, port 18001). Python 3,
+standard library only. Started by the script, or by hand:
+
+```bash
+python3 tests/redfish-mock-server.py --port 18001 --task-delay 2
+```
+
+Options: `--task-delay N` (seconds a compose takes, 0 answers at once),
+`--hot-plug` (allow block changes on a running machine), `--no-auth`,
+`--latency N` (slow every request), `--host`, `--user`, `--password`,
+`--quiet`. Pass extra options through the script with `MOCK_ARGS`, e.g.
+`MOCK_ARGS="--hot-plug" tests/redfish/servers.sh restart mock`. State is
+in memory and starts fresh on every start.
+
+**DMTF emulator** (port 5000). The script does everything the first time:
+clones `DMTF/Redfish-Interface-Emulator` at commit `5f51d8a` into
+`$REDFISH_STATE` (default `/tmp/redfish-test`), applies
+`tests/dmtf-emulator-composition.patch`, creates a Python virtual
+environment with its requirements, and starts it. This needs internet
+access, `git` and `python3-venv`. Things to know about it:
+
+- composing needs at least two blocks (its zone check fails with one)
+- it ignores the requested name and calls the machine "My Computer System"
+- machines start powered on, and it accepts any credentials
+- attach and detach are refused
+- it starts empty again whenever it is restarted
+
+### The wrapper and the scripts
+
+All in `tests/redfish/`.
+
+| File | What it is |
+| --- | --- |
+| `rf` | `virsh` pointed at a server: `rf [-s mock\|emulator\|URI] COMMAND...` |
+| `servers.sh` | start, stop, status, restart of the two local servers |
+| `demo.sh [mock\|emulator]` | walks through nodedev, compose, power, attach and detach, decompose |
+| `events-test.sh [mock\|emulator]` | one process listens for events, others change a machine |
+| `closerace.sh [runs]` + `closerace.c` | closes connections during an event poll, from `virsh` and from a C program with its own event-loop thread |
+| `auth.conf` | sample libvirt auth file for the local servers |
+| `domain-mock.xml`, `domain-emulator.xml` | machines to compose on each server |
+| `attach-gpu2.xml`, `detach-gpu1.xml`, `attach-nvme1.xml` | device XML naming a block in `<alias>` |
+
+`rf` finds the build in `build/` (or `$REDFISH_BUILD_DIR`) and the
+credentials in `tests/redfish/auth.conf` (or `$LIBVIRT_AUTH_FILE`). It
+closes stdin so that nothing waits for a password; set
+`REDFISH_INTERACTIVE=1` to allow prompts or to run the `virsh` shell.
+
+A first session:
+
+```bash
+tests/redfish/servers.sh start mock
+tests/redfish/rf nodedev-list
+tests/redfish/rf define tests/redfish/domain-mock.xml
+tests/redfish/rf list --all
+tests/redfish/rf start ai-node-01
+tests/redfish/rf destroy ai-node-01
+tests/redfish/rf attach-device ai-node-01 tests/redfish/attach-gpu2.xml   # the mock wants it off
+tests/redfish/rf dumpxml ai-node-01
+tests/redfish/rf undefine ai-node-01
+```
+
+or just `tests/redfish/demo.sh` (add `emulator` for the other server).
+
+libvirt's own tests which cover what this driver changed:
+
+```bash
+meson test -C build virschematest virerrortest check-symfile check-symsorting \
+    check-drivername qemuxmlconftest domaincapstest genericxml2xmltest
+```
+
+### A remote or real service
+
+Nothing changes except the URI. Use `rf -s URI`, or `virsh -c URI`:
+
+```
+redfish://USER@HOST[:PORT]/?transport=https&no_verify=1&timeout=600&poll=5
+```
+
+- `transport` is `https` unless said otherwise; the port defaults to 443
+  (80 for `http`).
+- `no_verify=1` skips certificate checking. Use it only for a self-signed
+  certificate you know. The default checks the certificate.
+- Credentials are never put in the URI. Add them to an auth file, keyed by
+  the host name used in the URI (there is an example in `auth.conf`), and
+  point `LIBVIRT_AUTH_FILE` at it, or let `virsh` ask (with
+  `REDFISH_INTERACTIVE=1` when using `rf`).
+- Raise `timeout` if the service takes long to compose (the default waits
+  10 minutes for an asynchronous operation).
+
+```bash
+export LIBVIRT_AUTH_FILE=~/redfish-auth.conf
+build/run build/tools/virsh -c "redfish://composer@bmc.example.com/?no_verify=1" version
+```
+
+A careful order for a first contact with a real service, stopping at the
+first thing which looks wrong:
+
+1. `version`: connects, logs in, and finds the composition service.
+2. `nodedev-list`, then `nodedev-dumpxml` on a few blocks: reads only.
+3. `list --all`: reads only; shows the composed systems.
+4. Compose a small machine from blocks which nobody uses, then `dumpxml`
+   and `dominfo` to compare with what the service's own interface shows.
+5. Power it on and off.
+6. Attach and detach, then `undefine`.
+
+To see what is sent, switch on the driver's log. It prints each request's
+method, URL and status (never passwords, tokens or bodies):
+
+```bash
+LIBVIRT_LOG_FILTERS="1:redfish" LIBVIRT_LOG_OUTPUTS="1:stderr" \
+    build/run build/tools/virsh -c "redfish://..." nodedev-list
+```
+
+Likely differences between services are the ones listed under
+"Compatibility" and the emulator findings in Testing: member layout,
+redirects, error formats, reply bodies, names and ids, whether `PATCH` of
+the block list is allowed, and whether a change needs the machine off.
+When one shows up, the mock server is the place to reproduce it before
+changing the driver.
+
 ## Testing
 
 `tests/redfish-mock-server.py` is a small in-memory composition service:
@@ -491,6 +652,12 @@ Things which work but not as well as they should.
   guarantees unique. Choices: keep `Name`; use `Id`, which changes the
   names seen with services that honour `Name`; or use `Name` and fall back
   to `Id` when it is not unique. Not decided.
+- **One vanished system spoils a listing.** Listing reads the collection and
+  then each member. If a member is deleted in between (or, as with DMTF's
+  emulator, is still listed for a moment after deletion) the read of it
+  fails with a 404 and so does the whole listing. Event polling logs the
+  failure and recovers on the next round; `virsh list` shows the error.
+  Skipping members which are gone would fix it.
 - **Late and lossy events.** Events are polled (decision 12), so they
   arrive up to one `poll` interval late and a change which comes and goes
   within one interval is missed. Only domain lifecycle events exist.

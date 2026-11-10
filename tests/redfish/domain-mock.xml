@@ -1,0 +1,8 @@
+<domain type='redfish' xmlns:redfish='http://libvirt.org/schemas/domain/redfish/1.0'>
+  <name>ai-node-01</name>
+  <os><type arch='x86_64'>hvm</type><boot dev='network'/></os>
+  <redfish:composition>
+    <redfish:block name='Compute1'/>
+    <redfish:block name='GPU1'/>
+  </redfish:composition>
+</domain>

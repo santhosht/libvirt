@@ -1,0 +1,3 @@
+<disk type='network' device='disk'>
+  <alias name='NVMe1'/>
+</disk>

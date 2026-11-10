@@ -1,0 +1,3 @@
+<hostdev mode='subsystem' type='pci'>
+  <alias name='GPU2'/>
+</hostdev>
