@@ -43,6 +43,153 @@ Non-goals (for now)
 Systems that are not `Composed` (for example a management node) are never
 shown as domains.
 
+## Design decisions
+
+These were made while building the driver. Each says what was chosen, why,
+and what it costs. Only the first was put to the project owner (who chose
+to keep it); the rest are the implementer's calls and are open to change.
+
+### 1. The driver lives inside the libvirt tree
+
+The original specification suggested prototyping outside libvirt first (a
+mock server, a Python mapping, then a standalone C program). Instead the
+driver was written as a regular libvirt driver. This was chosen without
+asking, and was kept after the owner reviewed the alternative.
+
+- Why: `virsh`, Ansible, Terraform and the rest only work with something
+  libvirt itself loads. A standalone program would not give them that.
+- Cost: 11 existing libvirt files changed (the `redfish` virt type, the
+  error domain, registration, the meson option and the schema), and the
+  driver depends on libvirt internals (its JSON, XML and node device code).
+- Alternative: a standalone program against the same mock server. It would
+  leave libvirt untouched but would not work with `virsh`.
+
+### 2. A client-side driver, not a daemon driver
+
+Like ESX and Hyper-V, the driver runs in the calling process and has no
+daemon of its own.
+
+- Why: nothing needs to be kept between calls, so a daemon adds nothing.
+- Cost: events and polling exist only while some client runs, and there is
+  no shared event delivery between clients.
+
+### 3. libcurl and libvirt's JSON code, not libredfish
+
+The specification named DMTF's libredfish.
+
+- Why: libvirt already builds against curl and json-c, so no new
+  dependency. It also keeps control of the parts services handle
+  differently: sessions, redirects, and following tasks.
+- Cost: a small HTTP client (`redfish_client.c`) to maintain.
+
+### 4. A new domain type, `redfish`
+
+The specification showed `type='physical'`.
+
+- Why: a libvirt domain type names the driver that handles it, and the
+  driver needs its own to mark domains and to select the XML namespace.
+- Cost: every place which switches over domain types needed a case for it.
+
+### 5. Blocks are listed in a driver namespace, not as devices
+
+The specification put a GPU in `<hostdev>` with a PCI address and storage in
+`<disk>`. Here the domain lists the blocks in `<redfish:composition>`.
+
+- Why: a block that is not attached to any host has no PCI address, and a
+  made up address would be wrong. A namespace element is libvirt's normal
+  place for driver specific data, and the block names match node devices.
+- Cost: the XML is not portable to other drivers, and tools which look in
+  `<devices>` do not see the hardware.
+- Alternative: derive `<hostdev>` and `<disk>` entries from the blocks. Not
+  done because of the addresses.
+
+### 6. Attach and detach take the block name from `<alias>`
+
+- Why: tools keep working with ordinary `<hostdev>` and `<disk>` elements.
+  libvirt's own device parser cannot be used, since it requires a PCI
+  source address, so only the alias is read.
+- Cost: `<alias>` is used for something other than its usual meaning, and
+  the rest of the element is ignored.
+- Alternative: a driver specific command. It would be cleaner but `virsh`
+  would not know it.
+
+### 7. Hardware comes from the blocks, not from the XML
+
+`<memory>`, `<vcpu>` and `<uuid>` are accepted and ignored; CPU and memory
+shown are the service's `ProcessorSummary` and `MemorySummary`.
+
+- Why: the hardware is what the chosen blocks provide. Requesting
+  something else would not be honoured.
+- Cost: the XML can say something different from the result without any
+  warning. Warning or failing on a mismatch is on the next steps list.
+- Alternative: add up the blocks in the driver. Not done since the service
+  is the authority on what the machine really has, and it avoids the
+  driver having to know how every kind of block counts.
+
+### 8. Resource blocks are mapped to existing node device types
+
+Blocks become `pci`, `storage` or `system` devices.
+
+- Why: new node device capability types would touch the node device
+  schema, XML, and tools. The existing ones are understood everywhere.
+- Cost: the mapping is approximate. For example a CPU block is a `system`
+  device with a product line, and a GPU has vendor and product IDs but no
+  address.
+
+### 9. No state is kept
+
+No local store of machines or blocks, and nothing is cached between
+connections. The service is the only source of truth, so changes made by
+others are seen at once.
+
+- Cost: every command reads from the service. Requests are kept down
+  (see "Keeping requests down"), but a service with many systems will feel
+  it until `$expand` is supported.
+- The only memory is a table of where systems were found, valid for one
+  connection and always checked before use.
+
+### 10. Only composed systems are domains
+
+Systems which are not `Composed` (management nodes, physical servers) are
+hidden. They are not something this driver created, and showing them next
+to the composed machines would make it easy to power one off by mistake.
+
+### 11. Define composes, undefine decomposes, and only when off
+
+`define` immediately composes real hardware, and `undefine` returns it to
+the pool only after the machine is powered off.
+
+- Why: for composed hardware, "defined" and "exists" are the same thing,
+  and decomposing a running machine would take hardware from under it.
+- Cost: no separate step to describe a machine without claiming hardware.
+
+### 12. Events come from polling
+
+- Why: the connection can't be told about changes, and the service's
+  server-sent events need a long lived second connection that not every
+  service supports. Polling works with any service, and costs nothing when
+  nobody listens.
+- Cost: delay of up to one interval, and short changes can be missed.
+- Alternative: server-sent events where offered (next steps).
+
+### 13. Security defaults
+
+- Passwords never appear in the URI; they come from libvirt's
+  authentication, so they stay out of process lists and logs.
+- Certificates are checked unless `no_verify=1` is given.
+- Redirects are followed by hand and only on the same service, because
+  letting curl follow them could send the session token to another host.
+- A session is used when the service has one, Basic authentication is the
+  fallback, and the session is deleted on disconnect.
+
+### 14. Two test services
+
+A small mock was written because no ready made service supported
+composition end to end. DMTF's Redfish Interface Emulator was used as an
+independent check of the read paths; it cannot compose (see Testing). The
+mock carries the implementer's reading of the specification, so a real
+service is still the real test.
+
 ## Source layout
 
 | File | Responsibility |
